@@ -30,68 +30,54 @@ torch.set_printoptions(linewidth=get_terminal_columns())
 ######################################################################################
 
 def output_ids_to_masks(*, output_ids, prompt_input_ids, pad_token_id, **kwargs):
-    """Returns a Namespace with 'attention_mask', 'completion_mask', and
-    'prompt_mask' keys, respectively giving int-valued (BS C)xT binary mask tensors
-    [attention_mask], [prompt_mask], and [completion_mask], defined by:
+    device = output_ids.device
+    BSxC,T = output_ids.shape
+    BS, S = prompt_input_ids.shape
+    C = int(BSxC / BS)
 
-    1. In [attention_mask], the ij index is 1 if the ij token of [output_ids] is a
-        non-pad token and 0 if it is a pad token
-    2. In [prompt_mask], the ij index is 1 if the ij token of [output_ids] is part of
-        a "prompt region" and 0 otherwise
-    3. In [completion_mask], the ij index is 1 if the ij token of [output_ids] is part
-        of a "completion region" and 0 otherwise
+    attention_mask = torch.where(output_ids != pad_token_id, 1, 0).to(device)
 
-    The PROMPT REGION of each sequence in [output_ids] is a contiguous span of tokens
-    starting with the first non-pad token in the sequence and ending with the last
-    token in the corresponding prompt in [prompt_input_ids].
+    # Calculate length of prompt i:
+    #   S - starting index of prompt i
+    input_prompt_start= torch.argmax(
+        (prompt_input_ids != pad_token_id).long(),
+        dim=1
+    ).to(device)
+
+    prompt_lengths = torch.sub(
+        torch.full([BS], S).to(device),
+        input_prompt_start
+    ).to(device)
+
+    C_prompt_lengths = einops.repeat(prompt_lengths, "BS -> (BS c)", c=C).to(device)
+
+    # prompt region = output_prompt_start + prompt_length
+    # Note: for each input prompt length need to apply to C
+    #   rows in output_prompt_start
+
+    output_ids_indices_per_row = einops.repeat(torch.arange(0, T), "T -> (bsxc) T", bsxc=BSxC).to(device)
+    output_prompt_start = torch.argmax(
+        (output_ids != pad_token_id).long(),
+        dim=1
+    ).to(device)
     
-    The COMPLETION REGION of each sequence in [output_ids] is simply all the tokens
-    that come after its prompt region. It may contain pad tokens.
+    output_prompt_end = torch.add(output_prompt_start, C_prompt_lengths)
+    output_prompt_start = output_prompt_start[:, None].to(device)
+    output_prompt_end = output_prompt_end[:, None].to(device)
 
-    Example:
-    Some row in [prompt_input_ids]:
-    [PAD PAD PAD    NON-PAD PAD NON-PAD]
-     -----------    -- prompt region --
-
-    Row of [output_ids] corresponding to a completion of this prompt:
-    [PAD PAD    NON-PAD PAD NON-PAD    PAD PAD NON-PAD NON-PAD PAD PAD PAD]
-     -------    -- prompt region --    --- completion region -------------
-
-    HINTS: 
-    1. Use torch.argmax() to find the start index of each prompt region
-        pytorch.org/docs/stable/generated/torch.argmax.html.
-    2. Infer the number of completions per prompt from the shapes of [output_ids] and
-        [prompt_input_ids].
-    3. The number of pad tokens prior to a given prompt region can differ between
-        different completions of the same prompt, and between the prompt in
-        [output_ids] and [prompt_input_ids].
-    ----------------------------------------------------------------------------------
+    prompt_mask = torch.where(
+        (output_ids_indices_per_row >= output_prompt_start) & (output_ids_indices_per_row < output_prompt_end),
+        1, 0
+    ).to(device)
     
-    Args:
-    output_ids          -- (BS C)xT tensor of token IDs returned by applying
-                            model.generate() to [prompt_input_ids] together with other
-                            arguments.
+    completion_mask = torch.where(
+        output_ids_indices_per_row >= output_prompt_end,
+        1,0
+    ).to(device)
 
-                            The first C sequences along the batch dimension contain
-                            the C completions for the first prompt (first row of
-                            [prompt_input_ids]), the next C sequences contain the C
-                            completions for the second prompt, and so on.
-
-    prompt_input_ids    -- BSxS tensor of token IDs used as input to model.generate()
-    pad_token_id        -- token ID used for padding
-    **kwargs            -- unused
-    """
-    raise NotImplementedError("Implement me!")
-    
-    # HINT: It might be easier to figure these out in the order [attention_mask], then
-    # [prompt_mask], and finally [completion_mask].
-    attention_mask = None   # Replace with your implementation
-    prompt_mask = None      # Replace with your implementation
-    completion_mask = None  # Replace with your implementation
-    return argparse.Namespace(attention_mask=attention_mask,
-        prompt_mask=prompt_mask,
-        completion_mask=completion_mask,)
-
+    return argparse.Namespace(attention_mask=attention_mask.int(),
+        prompt_mask=prompt_mask.int(),
+        completion_mask=completion_mask.int())
 
 ######################################################################################
 # DO NOT IMPLEMENT THESE! Instead, implement output_ids_to_masks() instead.
@@ -137,7 +123,17 @@ def get_per_token_logprobs(*, logits, token_ids, **kwargs):
     token_ids   -- BSxT tensor of token IDs
     **kwargs    -- unused
     """
-    raise NotImplementedError("Implement me!")
+    #raise NotImplementedError("Implement me!")
+    # convert scores to probabilities
+    log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+
+    # predicting next token doesnt need last logit or first token ID
+    logits_pred = log_probs[:, :-1, :]
+    next_tokens = token_ids[:, 1:]
+
+    # get probability for token
+    final_probs = torch.gather(logits_pred, -1, next_tokens.unsqueeze(-1))
+    return final_probs.squeeze(-1)
 
 def grpo_rl_objective(*, logprobs_model, logprobs_pi_old, advantages, grpo_clip=0.2, **kwargs):
     """Returns a BSxL tensor where the ij element is the GRPO policy objective.
@@ -161,7 +157,24 @@ def grpo_rl_objective(*, logprobs_model, logprobs_pi_old, advantages, grpo_clip=
     grpo_clip       -- clipping parameter for GRPO
     **kwargs        -- unused
     """
-    raise NotImplementedError("Implement me!")
+    #raise NotImplementedError("Implement me!")
+    # calculate the probability ratio
+    ratio = torch.exp(logprobs_model - logprobs_pi_old)
+
+    # get advantages
+    if advantages.shape != ratio.shape:
+        adv = advantages.unsqueeze(1)
+    else:
+        adv = advantages
+    
+    # paper: (Pi / Pi_old) * A_hat
+    part1 = ratio * adv
+
+    # paper: clip(Pi / Pi_old, 1-e, 1+e) * A_hat
+    ratio_c = torch.clamp(ratio, 1 - grpo_clip, 1 + grpo_clip)
+    part2 = ratio_c * adv
+
+    return torch.min(part1, part2)
 
 def gpro_kl_loss(*, logprobs_model, logprobs_pi_ref, **kwargs):
     """Returns a BSxT tensor where the ij element is the modified KL loss for jth
@@ -178,7 +191,12 @@ def gpro_kl_loss(*, logprobs_model, logprobs_pi_ref, **kwargs):
     logprobs_pi_ref -- BSxT tensor of log-probabilities from the model pi_ref
     **kwargs        -- unused
     """
-    raise NotImplementedError("Implement me!")
+    #raise NotImplementedError("Implement me!")
+    # formula: exp(log_ref - log_model) - (log_ref - log_model) - 1
+    log_ratio = logprobs_pi_ref - logprobs_model
+    ratio = torch.exp(log_ratio)
+
+    return ratio - log_ratio - 1
 
 def rewards_to_advantages(*, rewards, grpo_completions, **kwargs):
     """Returns a (BS C)-length tensor of advantages computed from [rewards] using
@@ -190,7 +208,15 @@ def rewards_to_advantages(*, rewards, grpo_completions, **kwargs):
     rewards             --(BS C)-length tensor of rewards
     grpo_completions    -- number of completions per prompt
     """
-    raise NotImplementedError("Implement me!")
+    #raise NotImplementedError("Implement me!")
+    # split into sections of size grpo_completions
+    matrix = rewards.view(-1, grpo_completions)
+
+    # caclulate mean and std
+    mean = matrix.mean(dim=1, keepdim=True)
+    std = matrix.std(dim=1, keepdim=True)
+    advantages = (matrix - mean) / (std + 1e-4)
+    return advantages.view(-1)
 
 @torch.no_grad()
 def test_fn(*, fn, fn_args, fn_kwargs, fn_expected_output, device="cpu", verbose=False):

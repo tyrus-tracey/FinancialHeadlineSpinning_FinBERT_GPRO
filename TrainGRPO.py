@@ -387,7 +387,7 @@ def grpo_step_to_loss(*, output_ids, attention_mask, completion_mask,
         # shape of eg. [logprobs_model].
         # HINT: read the sentences above the equation.
 
-        raise NotImplementedError("Implement me!")
+        loss = -(rl_loss - args.grpo_kl_weight * kl_loss)
 
         # With the per-token loss computed: (1) Weight the contribution of the entire
         # batch by the number of remaining tokens. This puts the mean loss per token
